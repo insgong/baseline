@@ -1,8 +1,3 @@
-# -*- coding: utf-8 -*-
-# @Time    : 2019/7/23 19:41
-# @Author  : YYLin
-# @Email   : 854280599@qq.com
-# @File    : New_Baseline_Cat.py
 import numpy as np
 import pandas as pd
 import catboost as cbt
@@ -20,8 +15,8 @@ warnings.filterwarnings('ignore')
 
 # ().run_line_magic('matplotlib', 'inline')
 
-train = pd.read_table("data/traindata.txt")
-test = pd.read_table("data/testdata.txt")
+train = pd.read_csv("/home/aistudio/data/data11100/round1_iflyad_anticheat_traindata_2.csv")
+test = pd.read_csv("/home/aistudio/data/data11100/round1_iflyad_anticheat_testdata_feature_2.csv")
 all_data = train.append(test).reset_index(drop=True)
 
 '''
@@ -123,6 +118,11 @@ print(X_train.shape, X_test.shape)
 del all_data
 gc.collect()
 
+X_train.fillna(method='ffill',inplace=True)
+X_test.fillna(method='ffill',inplace=True)
+
+
+
 random_seed = 2019
 final_pred = []
 cv_model = []
@@ -134,7 +134,7 @@ for index, (train_index, test_index) in enumerate(skf.split(X_train, y)):
                                        y.iloc[train_index], y.iloc[test_index]
 
     # cat_features是指 用来做处理的类别特征
-    cbt_model = cbt.CatBoostClassifier(iterations=3000, learning_rate=0.05, max_depth=11, l2_leaf_reg=1, verbose=10,
+    cbt_model = cbt.CatBoostClassifier(iterations=3000, learning_rate=0.05, max_depth=11, l2_leaf_reg=1, verbose=100,
                                        early_stopping_rounds=400, task_type='GPU', eval_metric='F1',
                                        cat_features=cat_list)
 
