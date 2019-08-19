@@ -1,43 +1,28 @@
 import numpy as np
 import pandas as pd
-import catboost as cbt
-from sklearn.metrics import f1_score
 import gc
 from tqdm import tqdm
-from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import KFold
 from sklearn.preprocessing import LabelEncoder
-from collections import Counter
-import matplotlib.pyplot as plt
-from datetime import timedelta, datetime
-
+from datetime import timedelta
+import catboost as cbt
+import lightgbm as lgb
+import xgboost as xgb
+from sklearn.metrics import f1_score
+from sklearn.linear_model import LogisticRegression
 import warnings
 warnings.filterwarnings('ignore')
-
-# ().run_line_magic('matplotlib', 'inline')
-
+from scipy import stats
+ 
+# 读取训练集中的数据
 train = pd.read_csv("/home/aistudio/data/data11100/round1_iflyad_anticheat_traindata_2.csv")
 test = pd.read_csv("/home/aistudio/data/data11100/round1_iflyad_anticheat_testdata_feature_2.csv")
 all_data = train.append(test).reset_index(drop=True)
-
-'''
-# 增加对缺失数据进行填充 2019/7/22
-all_data['city'] = all_data['city'].fillna(method='pad')
-all_data['lan'] = all_data['lan'].fillna(method='pad')
-all_data['make'] = all_data['make'].fillna(method='pad')
-all_data['model'] = all_data['model'].fillna(method='pad')
-all_data['osv'] = all_data['osv'].fillna(method='pad')
-all_data['ver'] = all_data['ver'].fillna(method='pad')
-print('填充了city之后all_train的信息:', all_data.info())
-'''
-
-# 对时间的处理
+ 
 all_data['time'] = pd.to_datetime(all_data['nginxtime'] * 1e+6) + timedelta(hours=8)
 all_data['day'] = all_data['time'].dt.dayofyear
 all_data['hour'] = all_data['time'].dt.hour
-
-# Data Clean  model表示设备型号 查看的是机型 厂商 以及
-# 实现技术 怎么使用sklearn处理？？？？？？？？
-# 全部变成大写，防止oppo 和 OPPO 的出现  对设备机型的处理
+ 
 all_data['model'].replace('PACM00', "OPPO R15", inplace=True)
 all_data['model'].replace('PBAM00', "OPPO A5", inplace=True)
 all_data['model'].replace('PBEM00', "OPPO R17", inplace=True)
@@ -47,22 +32,19 @@ all_data['model'].replace('PAAM00', "OPPO R15_1", inplace=True)
 all_data['model'].replace('PACT00', "OPPO R15_2", inplace=True)
 all_data['model'].replace('PABT00', "OPPO A5_1", inplace=True)
 all_data['model'].replace('PBCM10', "OPPO R15x", inplace=True)
-
-# 需要分析一下 经过该操作之前的数据类型和之后的数据值
 for fea in ['model', 'make', 'lan']:
     all_data[fea] = all_data[fea].astype('str')
     all_data[fea] = all_data[fea].map(lambda x: x.upper())
-
+ 
     from urllib.parse import unquote
-
-
+ 
     def url_clean(x):
         x = unquote(x, 'utf-8').replace('%2B', ' ').replace('%20', ' ').replace('%2F', '/').replace('%3F', '?').replace(
             '%25', '%').replace('%23', '#').replace(".", ' ').replace('??', ' '). \
             replace('%26', ' ').replace("%3D", '=').replace('%22', '').replace('_', ' ').replace('+', ' ').replace('-',
                                                                                                                    ' ').replace(
             '__', ' ').replace('  ', ' ').replace(',', ' ')
-
+ 
         if (x[0] == 'V') & (x[-1] == 'A'):
             return "VIVO {}".format(x)
         elif (x[0] == 'P') & (x[-1] == '0'):
@@ -73,42 +55,130 @@ for fea in ['model', 'make', 'lan']:
             return "HW {}".format(x)
         else:
             return x
-
-
+ 
     all_data[fea] = all_data[fea].map(url_clean)
-
-# 观察数据中机型和商场是否一致
+ 
 all_data['big_model'] = all_data['model'].map(lambda x: x.split(' ')[0])
 all_data['model_equal_make'] = (all_data['big_model'] == all_data['make']).astype(int)
-
-# H,W,PPI
+ 
+# 处理 ntt 的数据特征 但是不删除之前的特征 将其归为新的一列数据
+all_data['new_ntt'] = all_data['ntt']
+all_data.new_ntt[(all_data.new_ntt == 0) | (all_data.new_ntt == 7)] = 0
+all_data.new_ntt[(all_data.new_ntt == 1) | (all_data.new_ntt == 2)] = 1
+all_data.new_ntt[all_data.new_ntt == 3] = 2
+all_data.new_ntt[(all_data.new_ntt >= 4) & (all_data.new_ntt <= 6)] = 3
+ 
+# 使用make填充 h w ppi值为0.0的数据
+all_data['h'].replace(0.0, np.nan, inplace=True)
+all_data['w'].replace(0.0, np.nan, inplace=True)
+# all_data['ppi'].replace(0.0, np.nan, inplace=True)
+# cols = ['h', 'w', 'ppi']
+cols = ['h', 'w']
+gp_col = 'make'
+for col in tqdm(cols):
+    na_series = all_data[col].isna()
+    names = list(all_data.loc[na_series, gp_col])
+    # 使用均值 或者众数进行填充缺失值
+    # df_fill = all_data.groupby(gp_col)[col].mean()
+    df_fill = all_data.groupby(gp_col)[col].agg(lambda x: stats.mode(x)[0][0])
+    t = df_fill.loc[names]
+    t.index = all_data.loc[na_series, col].index
+    # 相同的index进行赋值
+    all_data.loc[na_series, col] = t
+    all_data[col].fillna(0.0, inplace=True)
+    del df_fill
+    gc.collect()
+ 
+# H, W, PPI
 all_data['size'] = (np.sqrt(all_data['h'] ** 2 + all_data['w'] ** 2) / 2.54) / 1000
 all_data['ratio'] = all_data['h'] / all_data['w']
 all_data['px'] = all_data['ppi'] * all_data['size']
 all_data['mj'] = all_data['h'] * all_data['w']
-
+ 
+# 强特征进行组合
+Fusion_attributes = ['make_adunitshowid',  'adunitshowid_model', 'adunitshowid_ratio', 'make_model',
+                     'make_osv', 'make_ratio', 'model_osv', 'model_ratio', 'model_h', 'ratio_osv']
+ 
+for attribute in tqdm(Fusion_attributes):
+    name = "Fusion_attr_" + attribute
+    dummy = 'label'
+    cols = attribute.split("_")
+    cols_with_dummy = cols.copy()
+    cols_with_dummy.append(dummy)
+    gp = all_data[cols_with_dummy].groupby(by=cols)[[dummy]].count().reset_index().rename(index=str, columns={dummy: name})
+    all_data = all_data.merge(gp, on=cols, how='left')
+    
+# 对ip地址和reqrealip地址进行分割 定义一个machine的关键字
+all_data['ip2'] = all_data['ip'].apply(lambda x: '.'.join(x.split('.')[0:2]))
+all_data['ip3'] = all_data['ip'].apply(lambda x: '.'.join(x.split('.')[0:3]))
+all_data['reqrealip2'] = all_data['reqrealip'].apply(lambda x: '.'.join(x.split('.')[0:2]))
+all_data['reqrealip3'] = all_data['reqrealip'].apply(lambda x: '.'.join(x.split('.')[0:3]))
+all_data['machine'] = 1000*all_data['model'] + all_data['make']
+ 
+var_mean_attributes = ['adunitshowid', 'make', 'model', 'ver']
+for attr in tqdm(var_mean_attributes):
+ 
+    # 统计关于ratio的方差和均值特征
+    var_label = 'ratio'
+    var_name = 'var_' + attr + '_' + var_label
+    gp = all_data[[attr, var_label]].groupby(attr)[var_label].var().reset_index().rename(index=str, columns={var_label: var_name})
+    all_data = all_data.merge(gp, on=attr, how='left')
+    all_data[var_name] = all_data[var_name].fillna(0).astype(int)
+ 
+    mean_label = 'ratio'
+    mean_name = 'mean_' + attr + '_' + mean_label
+    gp = all_data[[attr, mean_label]].groupby(attr)[mean_label].mean().reset_index().rename(index=str, columns={mean_label: mean_name})
+    all_data = all_data.merge(gp, on=attr, how='left')
+    all_data[mean_name] = all_data[mean_name].fillna(0).astype(int)
+ 
+    # 统计关于h的方差和均值特征
+    var_label = 'h'
+    var_name = 'var_' + attr + '_' + var_label
+    gp = all_data[[attr, var_label]].groupby(attr)[var_label].var().reset_index().rename(index=str,
+                                                                                         columns={var_label: var_name})
+    all_data = all_data.merge(gp, on=attr, how='left')
+    all_data[var_name] = all_data[var_name].fillna(0).astype(int)
+ 
+    mean_label = 'h'
+    mean_name = 'mean_' + attr + '_' + mean_label
+    gp = all_data[[attr, mean_label]].groupby(attr)[mean_label].mean().reset_index().rename(index=str, columns={
+        mean_label: mean_name})
+    all_data = all_data.merge(gp, on=attr, how='left')
+    all_data[mean_name] = all_data[mean_name].fillna(0).astype(int)
+ 
+    # 统计关于h的方差和均值特征
+    var_label = 'w'
+    var_name = 'var_' + attr + '_' + var_label
+    gp = all_data[[attr, var_label]].groupby(attr)[var_label].var().reset_index().rename(index=str,
+                                                                                         columns={var_label: var_name})
+    all_data = all_data.merge(gp, on=attr, how='left')
+    all_data[var_name] = all_data[var_name].fillna(0).astype(int)
+ 
+    mean_label = 'w'
+    mean_name = 'mean_' + attr + '_' + mean_label
+    gp = all_data[[attr, mean_label]].groupby(attr)[mean_label].mean().reset_index().rename(index=str, columns={
+        mean_label: mean_name})
+    all_data = all_data.merge(gp, on=attr, how='left')
+    all_data[mean_name] = all_data[mean_name].fillna(0).astype(int)
+ 
+    del gp
+    gc.collect()
+ 
 cat_col = [i for i in all_data.select_dtypes(object).columns if i not in ['sid', 'label']]
-
-# 但是数据集中并没有使用这个属性列
-both_col = []
-
 for i in tqdm(cat_col):
     lbl = LabelEncoder()
     all_data['count_' + i] = all_data.groupby([i])[i].transform('count')
-    all_data['rank_' + i] = all_data['count_' + i].rank(method='min')
     all_data[i] = lbl.fit_transform(all_data[i].astype(str))
-    both_col.extend([i + "_count", i + "_rank"])
-
-# 统计在这几个样本中出现的次数
+ 
 for i in tqdm(['h', 'w', 'ppi', 'ratio']):
     all_data['{}_count'.format(i)] = all_data.groupby(['{}'.format(i)])['sid'].transform('count')
-    all_data['{}_rank'.format(i)] = all_data['{}_count'.format(i)].rank(method='min')
-
+ 
 feature_name = [i for i in all_data.columns if i not in ['sid', 'label', 'time']]
-cat_list = [i for i in train.columns if i not in ['sid', 'label', 'nginxtime']]
-
-from sklearn.metrics import roc_auc_score
-
+cat_list = ['pkgname', 'ver', 'adunitshowid', 'mediashowid', 'apptype', 'ip', 'city', 'province', 'reqrealip', 'adidmd5',
+            'imeimd5', 'idfamd5', 'openudidmd5', 'macmd5', 'dvctype', 'model', 'make', 'ntt', 'carrier', 'os', 'osv',
+            'orientation', 'lan', 'h', 'w', 'ppi',  'ip2', 
+            'ip3', 'reqrealip2', 'reqrealip3']
+ 
 tr_index = ~all_data['label'].isnull()
 X_train = all_data[tr_index][list(set(feature_name))].reset_index(drop=True)
 y = all_data[tr_index]['label'].reset_index(drop=True).astype(int)
@@ -117,54 +187,70 @@ print(X_train.shape, X_test.shape)
 # 节约一下内存
 del all_data
 gc.collect()
-
-X_train.fillna(method='ffill',inplace=True)
-X_test.fillna(method='ffill',inplace=True)
-
-
-
-random_seed = 2019
-final_pred = []
-cv_model = []
-n_split = 5
-skf = StratifiedKFold(n_splits=n_split, random_state=random_seed, shuffle=True)
-for index, (train_index, test_index) in enumerate(skf.split(X_train, y)):
-    print(index, )
-    train_x, test_x, train_y, test_y = X_train[feature_name].iloc[train_index], X_train[feature_name].iloc[test_index], \
-                                       y.iloc[train_index], y.iloc[test_index]
-
-    # cat_features是指 用来做处理的类别特征
-    cbt_model = cbt.CatBoostClassifier(iterations=3000, learning_rate=0.05, max_depth=11, l2_leaf_reg=1, verbose=100,
-                                       early_stopping_rounds=400, task_type='GPU', eval_metric='F1',
-                                       cat_features=cat_list)
-
-    cbt_model.fit(train_x[feature_name], train_y, eval_set=(test_x[feature_name], test_y))
-    cv_model.append(cbt_model)
-
-    if index == n_split-1:
-        fea = cv_model[index].feature_importances_
-        feature_name = cv_model[index].feature_names_
-        feature_importance = pd.DataFrame({'feature_name': feature_name, 'importance': fea})
-        feature_importance.to_csv('feature_importance_baseline_cat.csv', index=False)
-
-# Catboost比较适合类别较多的场景
-cv_pred = np.zeros((X_train.shape[0],))
-test_pred = np.zeros((X_test.shape[0],))
-for index, (train_index, test_index) in enumerate(skf.split(X_train, y)):
-    print(index)
-    train_x, test_x, train_y, test_y = X_train.iloc[train_index], X_train.iloc[test_index], y.iloc[train_index], y.iloc[test_index]
-
-    y_val = cv_model[index].predict_proba(test_x[feature_name])[:, 1]
-    print(y_val.shape)
-    cv_pred[test_index] = y_val
-    test_pred += cv_model[index].predict_proba(X_test[feature_name])[:, 1] / 5
-
+ 
+ 
+# 以下代码是5折交叉验证的结果 + lgb catboost xgb 最后使用logist进行回归预测
+def get_stacking(clf, x_train, y_train, x_test, feature_name, n_folds=5):
+    print('len_x_train:', len(x_train))
+ 
+    train_num, test_num = x_train.shape[0], x_test.shape[0]
+    second_level_train_set = np.zeros((train_num,))
+    second_level_test_set = np.zeros((test_num,))
+    test_nfolds_sets = np.zeros((test_num, n_folds))
+    kf = KFold(n_splits=n_folds)
+ 
+    for i, (train_index, test_index) in enumerate(kf.split(x_train)):
+        x_tra, y_tra = x_train[feature_name].iloc[train_index], y_train[train_index]
+        x_tst, y_tst = x_train[feature_name].iloc[test_index], y_train[test_index]
+ 
+        clf.fit(x_tra[feature_name], y_tra, eval_set=(x_tst[feature_name], y_tst))
+ 
+        second_level_train_set[test_index] = clf.predict(x_tst[feature_name])
+        test_nfolds_sets[:, i] = clf.predict(x_test[feature_name])
+ 
+    second_level_test_set[:] = test_nfolds_sets.mean(axis=1)
+    return second_level_train_set, second_level_test_set
+ 
+ 
+def lgb_f1(labels, preds):
+    score = f1_score(labels, np.round(preds))
+    return 'f1', score, True
+ 
+ 
+lgb_model = lgb.LGBMClassifier(random_seed=2019, n_jobs=-1, objective='binary', learning_rate=0.05, n_estimators=3000,
+                               num_leaves=31, max_depth=-1, min_child_samples=50, min_child_weight=9, subsample_freq=1,
+                               subsample=0.7, colsample_bytree=0.7, reg_alpha=1, reg_lambda=5, eval_metric=lgb_f1,
+                               early_stopping_rounds=400)
+ 
+xgb_model = xgb.XGBRegressor(max_depth=5, learning_rate=0.05, n_estimators=3000, silent=False, objective='binary',
+                             early_stopping_rounds=400, feval=lgb_f1)
+ 
+cbt_model = cbt.CatBoostClassifier(iterations=3000, learning_rate=0.05, max_depth=11, l2_leaf_reg=1, verbose=10,
+                                   early_stopping_rounds=400, task_type='GPU', eval_metric='F1', cat_features=cat_list)
+ 
+train_sets = []
+test_sets = []
+for clf in [cbt_model, lgb_model, xgb_model]:
+    print('begin train clf:', clf)
+    train_set, test_set = get_stacking(clf, X_train, y, X_test, feature_name)
+    train_sets.append(train_set)
+    test_sets.append(test_set)
+ 
+meta_train = np.concatenate([result_set.reshape(-1, 1) for result_set in train_sets], axis=1)
+meta_test = np.concatenate([y_test_set.reshape(-1, 1) for y_test_set in test_sets], axis=1)
+ 
+# 使用逻辑回归作为第二层模型
+bclf = LogisticRegression()
+bclf.fit(meta_train, y)
+test_pred = bclf.predict_proba(meta_test)[:, 1]
+ 
+# 提交结果
 submit = test[['sid']]
 submit['label'] = (test_pred >= 0.5).astype(int)
 print(submit['label'].value_counts())
-submit.to_csv("New_Baseline_Cat.csv", index=False)
+submit.to_csv("A_Simple_Stacking_Model.csv", index=False)
 
 # 打印预测地概率 方便以后使用融合模型
 df_sub = pd.concat([test['sid'], pd.Series(test_pred)], axis=1)
 df_sub.columns = ['sid', 'label']
-df_sub.to_csv('New_Baseline_Cat_proba-{}.csv'.format(datetime.now().strftime('%m%d_%H%M%S')), sep=',', index=False)
+df_sub.to_csv('A_Simple_Stacking_Model_proba.csv', sep=',', index=False)
